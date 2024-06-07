@@ -1,7 +1,5 @@
 import sys
-# sys.path.append('../../')
-# sys.path.append('./')
- 
+
 import os
 import argparse
 import wandb
@@ -14,7 +12,6 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
 
 from utils.utils import save_checkpoint, AverageMeter, Logger, OvRScore, time_to_str
 from utils.get_loader import get_dataset

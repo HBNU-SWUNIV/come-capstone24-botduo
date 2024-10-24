@@ -1,264 +1,239 @@
-import sys
-
 import os
+import shutil
 import argparse
+import random
+import timm
 import wandb
 import time
-import timm
-import random
+from glob import glob
 import numpy as np
-from datetime import datetime
+import pandas as pd
+import albumentations as A
+from PIL import Image
+from timeit import default_timer as timer
+from albumentations.pytorch import ToTensorV2
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torchvision import transforms
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from utils.utils import save_checkpoint, AverageMeter, Logger, OvRScore, time_to_str
-from utils.get_loader import get_dataset
-from timeit import default_timer as timer
+from arch.iformer.inception_transformer import iformer_small, iformer_base
+from utils.datasets import StegDataset
+from utils.utils import save_checkpoint, time_to_str
 
-def train(args, device):
-    if args.use_wandb:
-        wandb.init(project='2024_CapstoneDesign', entity='kumdingso')
+def worker_init_fn(worker_id):
+    random.seed(args.seed + worker_id)
+    np.random.seed(args.seed + worker_id)
 
-        if args.run_name != '':
-            wandb.run.name = f'{args.run_name}_to_{args.test_attack_type}'
-        else:
-            wandb.run.name = f'Capstone_Design_Train_to_{args.test_attack_type}'
-    else:
-        pass
-
-    os.makedirs(args.logs, exist_ok=True)
-    
-    train_dataloader_real, \
-    train_dataloader_spoof, \
-    test_dataloader_real, \
-    test_dataloader_spoof = get_dataset(args)
-
-    # Accessing individual spoof dataloaders
-    print('-------------Training Dataset Info -------------')
-    print(f"Live Dataset: {len(train_dataloader_real.dataset)}")
-    for attack_type, dataloader in train_dataloader_spoof.items():
-        print(f"{attack_type} Dataset: {len(dataloader.dataset)}")
-
-    print('-------------Test Dataset Info -------------')
-    print(f"Live Dataset: {len(test_dataloader_real.dataset)}")
-    print(f'Spoof Dataset: {len(test_dataloader_spoof.dataset)}')
-    
-    train_total_loss = AverageMeter()
-    
-    log = Logger()
-    # log.open(args.logs + args.test_attack_type + '_log.txt', mode='w')
-    log.open(args.logs + f'[{datetime.now().strftime("%Y%m%d_%H%M%S")}] ' + args.test_attack_type + '_log.txt', mode='w')
-    log.write("\n----------------------------------------------- [START %s] %s\n\n" % (
-    datetime.now().strftime('%Y-%m-%d %H:%M:%S'), '-' * 51))
-    log.write(
-        '--------------|------------- TRAIN -------------|-------------- TEST -------------|-------- BEST -------|--------------|\n')
-    log.write(
-        '     ITER     |     Loss      HTER      AUC     |     Loss      HTER      AUC     |    ITER      HTER   |     time     |\n')
-    log.write(
-        '-----------------------------------------------------------------------------------------------------------------------|\n')
-    start = timer()
-    
-
-    # net = DiViT(encoder=encoder, num_classes=2).to(device)
-    net = timm.create_model('mobilevit_s', pretrained=True, num_classes=2).to(device)
-    
-    criterion = {
-        'CE': nn.CrossEntropyLoss().cuda(),
-    }
-    optimizer_dict = [
-        {"params": filter(lambda p: p.requires_grad, net.parameters()), "lr": args.init_lr},
-    ]
-    optimizer = optim.AdamW(optimizer_dict, lr=args.init_lr, weight_decay=args.weight_decay)
-
-    if(len(args.gpu) > 1):
-        net = torch.nn.DataParallel(net).cuda()
-
-    best_hter = 1.0
-    best_iter = 0
-    
-    max_iter = args.max_iter
-    epoch = 1
-    iter_per_epoch = 10
-    
-    real_iter = iter(train_dataloader_real)
-    real_iter_per_epoch = len(real_iter)
-    spoof_iters = {attack_type: iter(dataloader) for attack_type, dataloader in train_dataloader_spoof.items()}
-    spoof_iters_per_epoch = {attack_type: len(dataloader) for attack_type, dataloader in train_dataloader_spoof.items()}
-
-    for iter_num in range(max_iter):
-        if (iter_num % real_iter_per_epoch == 0):
-            real_iter = iter(train_dataloader_real)
-        for attack_type in spoof_iters:
-            if (iter_num % spoof_iters_per_epoch[attack_type] == 0):
-                spoof_iters[attack_type] = iter(train_dataloader_spoof[attack_type])
-        if (iter_num != 0 and iter_num % iter_per_epoch == 0):
-            epoch = epoch + 1
-            
-        param_lr_tmp = []
-        for param_group in optimizer.param_groups:
-            param_lr_tmp.append(param_group["lr"])
-
-        # Training Phase
-        net.train(True)
+def train(train_loader, model, criterion, optimizer, device, start_time):
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
+        outputs = model(images)
         
-        real_img, real_label = next(real_iter)
-        real_img = real_img.cuda()
-        real_label = real_label.cuda()
-        
-        spoof_imgs = []
-        spoof_labels = []
-        for attack_type in spoof_iters:
-            img, label = next(spoof_iters[attack_type])
-            spoof_imgs.append(img.cuda())
-            spoof_labels.append(label.cuda())
-        
-        input_data = torch.cat([real_img] + spoof_imgs, dim=0)
-        source_label = torch.cat([real_label] + spoof_labels, dim=0)
-        
-        ######### forward #########
-        outputs = net(input_data)
-        
-        ######### loss #########
-        loss = criterion["CE"](outputs, source_label)
-        train_loss = loss
-
-        train_total_loss.update(train_loss.item())
-        
-        ######### backward #########
-        train_loss.backward()
+        loss = criterion(outputs, labels)
+        loss.backward()
         optimizer.step()
 
-        ######### Evaluation #########
-        probs = []
-        train_probs = []
-        train_labels = []
-        probs = torch.softmax(outputs, dim=1).detach().cpu().numpy()
-        train_probs.extend(probs)
-        train_labels.extend(source_label.detach().cpu().numpy())
+        total_loss += loss.item()
+        probs = torch.softmax(outputs.data, dim=1)
+        _, predicted = torch.max(probs, 1)
+        correct += (predicted == labels).sum().item()
 
-        train_probs = np.array(train_probs)
-        train_labels = np.array(train_labels)
-        
-        train_auc, train_hter = OvRScore(train_probs, train_labels)
+    avg_loss = total_loss / len(train_loader)
+    accuracy = 100 * correct / len(train_loader.dataset)
+    
+    return avg_loss, accuracy
 
-        # Test Phase
-        net.eval()
+def validate(valid_loader, model, criterion, device, start_time):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    with torch.no_grad():
+        for images, labels in valid_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
 
-        test_probs = []
-        test_labels = []
-        test_total_loss = 0.0
-        with torch.no_grad():
-            for batch_idx, (inputs, labels) in enumerate(test_dataloader_real):
-                inputs, labels = inputs.to(device), labels.to(device)
-                
-                outputs = net(inputs)
-                
-                loss = criterion['CE'](outputs, labels)
-                test_total_loss += loss.item()
-                
-                probs = torch.softmax(outputs, dim=1).cpu().numpy()
-                test_probs.extend(probs)
-                test_labels.extend(labels.detach().cpu().numpy())
+            loss = criterion(outputs, labels)
 
-            for batch_idx, (inputs, labels) in enumerate(test_dataloader_spoof):
-                inputs, labels = inputs.to(device), labels.to(device)
-                
-                outputs = net(inputs)
-                
-                loss = criterion['CE'](outputs, labels)
-                test_total_loss += loss.item()
-                
-                probs = torch.softmax(outputs, dim=1).cpu().numpy()
-                test_probs.extend(probs)
-                test_labels.extend(labels.detach().cpu().numpy())
+            total_loss += loss.item()
+            probs = torch.softmax(outputs.data, dim=1)
+            _, predicted = torch.max(probs, 1)
+            correct += (predicted == labels).sum().item()
 
-        test_total_loss /= (len(test_dataloader_real) + len(test_dataloader_spoof))
-        test_probs = np.array(test_probs)
-        test_labels = np.array(test_labels)
-        
-        test_auc, test_hter = OvRScore(test_probs, test_labels)
+    avg_loss = total_loss / len(valid_loader)
+    accuracy = 100 * correct / len(valid_loader.dataset)
+    
+    return avg_loss, accuracy
 
-        is_best= best_hter >= test_hter
-        if is_best:
-            best_hter = test_hter
-            best_iter = iter_num
-
-        log.write('     %4i     |   %7.3f    %6.2f    %6.2f   |   %7.3f    %6.2f    %6.2f   |    %4i     %6.2f  | %s |' % (
-            iter_num,
-            train_total_loss.avg,
-            train_hter*100,
-            train_auc*100,
-            test_total_loss,
-            test_hter*100,
-            test_auc*100,
-            best_iter,
-            best_hter*100,
-            time_to_str(timer() - start, 'min')))
-        log.write('\n') 
-        
-        if args.save_models:
-            save_checkpoint(state={
-                'iter': iter_num,
-                'state_dict': net.state_dict(),
-                'best_hter': best_hter
-                }, gpus=args.gpu, is_best=is_best,
-                model_path=args.ckpt_root + f'/{args.run_name}_to_{args.test_attack_type}/',
-                model_name=f'iter{iter_num}.pth.tar')
-        if args.use_wandb:
-            wandb.log({
-                "train_loss": train_total_loss.avg,
-                "train_hter": train_hter,
-                "train_auc": train_auc,
-                "test_loss": test_total_loss,
-                'test_hter': test_hter,
-                'test_auc': test_auc,
-                'lr':optimizer.param_groups[0]["lr"]},
-                step=iter_num)
-        
-        time.sleep(0.01)
-    print('Best HTER: %6.2f' % (best_hter*100))
+def main(args):
+    start_time = time.time()
     if args.use_wandb:
-        wandb.finish()
+        if args.run_name == 'auto':
+            if args.stride is not None:
+                args.run_name = f'{args.backbone}_stride_{args.stride}_intra_{args.mobile_device}_{args.stego_method}_{args.batch_size}_{args.lr}'
+            else:
+                args.run_name = f'{args.backbone}_intra_{args.mobile_device}_{args.stego_method}_{args.batch_size}_{args.lr}'
+            if args.suffix != '':
+                args.run_name += f'_{args.suffix}'
+        wandb.run.name = args.run_name
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.backbone.split('-')[0] == 'timm':
+        model = timm.create_model(args.backbone.split('-')[1], pretrained=True, num_classes=2)
+    elif args.backbone == 'iformer-small':
+        model = iformer_small(pretrained=True)
+        model.head = nn.Linear(model.head.in_features, 2)
+    elif args.backbone == 'iformer-base':
+        model = iformer_base(pretrained=True)
+        model.head = nn.Linear(model.head.in_features, 2)
+
+    if args.stride is not None:
+        if args.backbone.split('-')[1] == 'mobilevit_s':
+            model.stem.conv.stride = (args.stride, args.stride)
+        elif args.backbone.split('-')[1] == 'efficientnet_b0':
+            model.conv_stem.stride = (args.stride, args.stride)
+        elif args.backbone.split('-')[0] == 'iformer':
+            model.patch_embed.proj1.conv = (args.stride , args.stride)
+
+    if args.pretrained_path is not None:
+        state_dict = torch.load(args.pretrained_path)['state_dict']
+        model.load_state_dict(state_dict)
+    
+    model = model.to(device)
+
+    train_df = pd.read_csv(f'{args.csv_root}/single/{args.data_type}/{args.cover_size}_{args.stego_method}/{args.mobile_device}_train.csv')
+    valid_df = pd.read_csv(f'{args.csv_root}/single/{args.data_type}/{args.cover_size}_{args.stego_method}/{args.mobile_device}_valid.csv')
+    
+    if args.apply_ipp:
+        ipp_train_df = pd.read_csv(f'{args.csv_root}/single/{args.data_type}/{args.cover_size}_ipp_random_{args.stego_method}/{args.mobile_device}_train.csv')
+        train_df = pd.concat([train_df[:len(train_df)//2], ipp_train_df[:len(ipp_train_df)//2]], ignore_index=True)
+
+    train_dataset = StegDataset(train_df, transform=train_transform)
+    valid_dataset = StegDataset(valid_df, transform=test_transform)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.workers_per_loader, shuffle=True, drop_last=True, worker_init_fn=worker_init_fn)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, num_workers=args.workers_per_loader, shuffle=False, drop_last=False, worker_init_fn=worker_init_fn)
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Print data num of each loader
+    if args.stride is not None:
+        print(f'Model: {args.backbone} with First conv stride({args.stride}, {args.stride})')
+    else:
+        print(f'Model: {args.backbone}')
+        
+    start_time = timer()      
+    print(f'Train Data: {len(train_loader.dataset)}')
+    print(f'Valid Data: {len(valid_loader.dataset)}')
+    print(f'=================================== {args.mobile_device} intra training ===================================')
+    best_valid_acc = 0.0
+    for epoch in range(1, args.epochs+1):
+        train_loss, train_acc = train(train_loader, model, criterion, optimizer, device, start_time)
+        valid_loss, valid_acc = validate(valid_loader, model, criterion, device, start_time)
+        print(f'Epoch [{epoch}/{args.epochs}], Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}, Valid Loss: {valid_loss:.4f}, Valid Acc: {valid_acc:.2f} | {time_to_str(timer()-start_time, mode="min")}')
+
+        if args.use_wandb:
+            wandb.log({'train_loss': train_loss, 'train_acc': train_acc, 'valid_loss': valid_loss, 'valid_acc': valid_acc}, step=epoch)
+        is_best = valid_acc >= best_valid_acc
+        if is_best:
+            best_epoch = epoch
+            best_train_acc = train_acc
+            best_valid_acc = valid_acc
+            if args.use_wandb:
+                wandb.log({'best_valid_acc': best_valid_acc}, step=epoch)
+                
+            if args.save_model:
+                save_checkpoint(
+                    state={
+                    'epoch': epoch,
+                    'state_dict': model.state_dict(),
+                    'best_valid_acc': best_valid_acc,
+                    },
+                    gpus=args.gpus,
+                    is_best=is_best,
+                    model_path=f'{args.ckpt_root}/{args.run_name}/',
+                    model_name=f'ep{epoch}.pth.tar')
+    print(f'Best Epoch Acc[{best_epoch}] - Train Acc: {best_train_acc:.2f}, Valid Acc: {best_valid_acc:.2f} | {time_to_str(timer()-start_time, mode="min")}')
+    wandb.finish()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    # Model Settings
-    parser.add_argument('--encoder', type=str, default='mobilevit_s', help='Backbone Name from timm library')
+    # Argument parsing
+    parser = argparse.ArgumentParser(description='2024 NSR Steganlysis Training Parser')
+    # Model Parsers
+    parser.add_argument('--backbone', type=str, default='timm-efficientnet_b0', help='Backbone name from timm library')
+    parser.add_argument('--pretrained_path', type=str, default=None, help='Path to pretrained model')
+    parser.add_argument('--stride', type=int, default=None, help='Stride of the backbone')
+    parser.add_argument('--save_model', action='store_true', help='Whether to save the model')
 
-    # Training Settings
-    parser.add_argument('--max_iter', type=int, default=100)
-    parser.add_argument('--batch_size_per_loader', type=int, default=8)
-    parser.add_argument('--init_lr', type=float, default=1e-4)
-    parser.add_argument('--warmup_epochs', type=int, default=0, metavar='N', help='epochs to warmup LR')
-    parser.add_argument('--min_lr', type=float, default=0., metavar='LR', help='lower lr bound for cyclic schedulers that hit 0')
-    parser.add_argument('--weight_decay', type=float, default=1e-6, help='weight decay for SGD or Adam, ...')
-    parser.add_argument('--test_attack_type', type=str, default='Partial_FunnyeyeGlasses')
-    
-    # MISC Settings
-    parser.add_argument('--ckpt_root', type=str, default='./ckpt/')
-    parser.add_argument('--csv_path', type=str, default='./csv/5_multiple_frame')
-    parser.add_argument('--logs', type=str, default='./logs/')
-    parser.add_argument('--use_wandb', action='store_true')
-    parser.add_argument('--save_models', action='store_true')
-    parser.add_argument('--run_name', type=str, default='Capstone_Design')
-    parser.add_argument('--gpu', type=str, default='0')
-    parser.add_argument('--seed', type=int, default=42)
+    # Training Parsers
+    parser.add_argument('--epochs', type=int, default=20, help='Number of epochs to train')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
+    parser.add_argument('--workers_per_loader', type=int, default=4, help='Number of workers per data loader')
+    parser.add_argument('--weight_decay', type=float, default=1e-6, help='Weight decay for optimizer')
+    parser.add_argument('--train_rate', type=float, default=0.7, help='Train split size')
+
+    # MISC Parsers
+    parser.add_argument('--csv_root', type=str, default='./csv/', help='Path to the csv')
+    parser.add_argument('--gpus', type=str, default='0', help='Comma-separated list of GPU IDs to use')
+    parser.add_argument('--seed', type=int, default=42, help='Seed for reproducibility') 
+    parser.add_argument('--ckpt_root', type=str, default='./ckpt/', help='Root directory for checkpoint saving')
+    parser.add_argument('--use_wandb', action='store_true', help='Whether to use wandb')
+    parser.add_argument('--run_name', type=str, default='auto', help='Run name for checkpoint saving')
+    parser.add_argument('--suffix', type=str, default='', help='Suffix for run name')
+
+    parser.add_argument('--mobile_device', type=str, default='Galaxy_Flip3',
+                        choices=['Galaxy_S10+','Galaxy_Flip3', 'Galaxy_Flip4', 'Galaxy_Fold3', 'Galaxy_Fold4', 'Galaxy_Note9',
+                                'Galaxy_S20+', 'Galaxy_S20FE', 'Galaxy_S21', 'Galaxy_S21_Ultra', 'Galaxy_S22', 
+                                'iPhone12_ProMax', 'Huawei_P30', 'LG_Wing'])
+    parser.add_argument('--data_type', type=str, default='PNG', choices=['PNG', 'JPEG'])
+    parser.add_argument('--cover_size', type=str, default='224')
+    parser.add_argument('--apply_ipp', action='store_true', help='Whether to apply IPP')
+    parser.add_argument('--stego_method', type=str, default='LSB_0.5')
     args = parser.parse_args()
 
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
-        torch.cuda.manual_seed(args.seed)
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
+    if args.gpus != '':
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
 
-    if args.gpu != '':
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    os.environ['PYTHONHASHSEED'] = str(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    train(args, device)
+    train_transform = A.Compose([
+        A.CenterCrop(height=224, width=224),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+        ToTensorV2(),
+    ])
+    test_transform = A.Compose([
+        A.CenterCrop(height=224, width=224),
+        A.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+        ToTensorV2(),
+    ])
+
+    if args.use_wandb:
+        wandb.init(project='2024_NSR_Steganalysis', entity='kumdingso')
+        wandb.save(f'./utils/datasets.py', policy='now')
+        wandb.save(f'./train.py', policy='now')
+        for arg in vars(args):
+            wandb.config[arg] = getattr(args, arg)
+    main(args)
+

@@ -24,13 +24,29 @@
     ![alt text](./Assets/Datasets.png)
 
     - 공간영역: 총 14종 기기의 PNG 포맷 데이터 사용
-    - 압축영역: 총 14종 기기의 JPEG 포맷 데이터 사용
+    - 압축영역: 총 19종 기기의 JPEG 포맷 데이터 사용
 
   - 시스템 개요
 
     ![alt text](./Assets/Overview.png)
     - 모델 성능개선을 위해 Laerning Rate 탐색, 모델의 Stride를 (2, 2)에서 (1, 1)로 변경
     - 모델의 일반화 성능개선을 위해 Sharpness-Aware Optimizer, Supervised Contrastive Loss 사용
+
+## 주요 실험 결과
+- ### 공간영역(PNG) 실험 결과
+  | Method                      | Intra Accuracy | Inter Accuracy |
+  |-----------------------------|----------------|----------------|
+  | Baseline                    | 92.58          | 88.30          |
+  | SAM(0.05)                   | 98.16          | 95.76          |
+  | 7(CE):3(SupCon)             | 92.85          | 88.50          |
+
+- ### 압축영역(JPEG) 실험 결과
+  | Method                      | Intra Accuracy | Inter Accuracy |
+  |-----------------------------|----------------|----------------|
+  | Baseline                    | 94.05          | 83.87          |
+  | SAM(0.05)                   | 95.10          | 84.29          |
+  | 7(CE):3(SupCon)             | 94.51          | 84.98          |
+  | SAM(0.001), 7(CE):3(SupCon) | 95.05          | 84.11          |
 
 ## 결론
 - 선정된 Backbone 모델 및 학습 기법을 사용하여 모델의 일반화 성능을 개선하여 다양한 촬영 환경 변화에도 안정적인 성능을 유지할 수 있다. 이로 인해 숨겨진 악성 코드나 데이터를 더 정확하게 탐지할 수 있어, 실제 환경에서 스테가노그래피 공격에 대한 보안 대응할 수 있다. 이러한 일반화 성능 덕분에 다양한 기기와 플랫폼에서 동일한 성능을 보장해, 다양한 보안 시스템에 폭넓게 활용될 수 있다.
@@ -39,6 +55,3 @@
 - Inception Transformer(iFormer): https://arxiv.org/abs/2205.12956
 - Sharpness-Aware Optimizer(SAM): https://arxiv.org/abs/2010.01412
 - Supervised Contrastive Loss(SupCon): https://arxiv.org/abs/2004.11362
-
-## Project Outcome
-- ### 2024년
